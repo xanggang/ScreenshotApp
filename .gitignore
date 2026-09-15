@@ -1,0 +1,9 @@
+# Xcode per-user state and build output
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+*.profraw
+
+# JetBrains per-user project settings
+.idea/
