@@ -66,8 +66,12 @@ final class ScreenCaptureService: ScreenCapturing, @unchecked Sendable {
             let filter = SCContentFilter(display: display, excludingWindows: [])
             request = CaptureRequest(
                 filter: filter,
-                sourceRect: sourceRect,
-                pixelSize: Self.pixelSize(for: sourceRect.size, scale: scale),
+                cropRectInDisplayPoints: sourceRect,
+                displayPointSize: display.frame.size,
+                // Capture the entire display, then crop the returned image.
+                // SCStreamConfiguration.sourceRect has inconsistent scaling on
+                // mixed-DPI displays, which can otherwise crop the wrong area.
+                pixelSize: (width: display.width, height: display.height),
                 scale: scale
             )
 
@@ -78,7 +82,8 @@ final class ScreenCaptureService: ScreenCapturing, @unchecked Sendable {
             let scale = Self.scale(forWindowBounds: window.bounds, displays: content.displays)
             request = CaptureRequest(
                 filter: SCContentFilter(desktopIndependentWindow: window.screenCaptureWindow),
-                sourceRect: nil,
+                cropRectInDisplayPoints: nil,
+                displayPointSize: nil,
                 pixelSize: Self.pixelSize(for: window.bounds.size, scale: scale),
                 scale: scale
             )
@@ -90,7 +95,8 @@ final class ScreenCaptureService: ScreenCapturing, @unchecked Sendable {
             let scale = Self.scale(for: display)
             request = CaptureRequest(
                 filter: SCContentFilter(display: display, excludingWindows: []),
-                sourceRect: nil,
+                cropRectInDisplayPoints: nil,
+                displayPointSize: nil,
                 pixelSize: (width: display.width, height: display.height),
                 scale: scale
             )
@@ -100,19 +106,28 @@ final class ScreenCaptureService: ScreenCapturing, @unchecked Sendable {
         configuration.showsCursor = false
         configuration.width = request.pixelSize.width
         configuration.height = request.pixelSize.height
-        if let sourceRect = request.sourceRect {
-            configuration.sourceRect = sourceRect
-        }
-
         do {
-            let image = try await SCScreenshotManager.captureImage(
+            let capturedImage = try await SCScreenshotManager.captureImage(
                 contentFilter: request.filter,
                 configuration: configuration
             )
+            let image: CGImage
+            if let cropRect = request.cropRectInDisplayPoints,
+               let displayPointSize = request.displayPointSize {
+                image = try Self.crop(
+                    capturedImage,
+                    to: cropRect,
+                    inDisplayOfPointSize: displayPointSize
+                )
+            } else {
+                image = capturedImage
+            }
             return CaptureResult(
                 image: image,
                 target: target,
-                scale: request.scale,
+                scale: request.cropRectInDisplayPoints == nil
+                    ? request.scale
+                    : CGFloat(image.width) / request.cropRectInDisplayPoints!.width,
                 capturedAt: Date()
             )
         } catch {
@@ -122,9 +137,35 @@ final class ScreenCaptureService: ScreenCapturing, @unchecked Sendable {
 
     private struct CaptureRequest {
         let filter: SCContentFilter
-        let sourceRect: CGRect?
+        let cropRectInDisplayPoints: CGRect?
+        let displayPointSize: CGSize?
         let pixelSize: (width: Int, height: Int)
         let scale: CGFloat
+    }
+
+    private static func crop(
+        _ image: CGImage,
+        to rectInDisplayPoints: CGRect,
+        inDisplayOfPointSize displayPointSize: CGSize
+    ) throws -> CGImage {
+        guard displayPointSize.width > 0, displayPointSize.height > 0 else {
+            throw ScreenshotAppError.captureFailed("显示器尺寸无效")
+        }
+
+        let xScale = CGFloat(image.width) / displayPointSize.width
+        let yScale = CGFloat(image.height) / displayPointSize.height
+        let cropRect = CGRect(
+            x: (rectInDisplayPoints.minX * xScale).rounded(.down),
+            y: (rectInDisplayPoints.minY * yScale).rounded(.down),
+            width: (rectInDisplayPoints.width * xScale).rounded(.up),
+            height: (rectInDisplayPoints.height * yScale).rounded(.up)
+        ).intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height)).integral
+
+        guard cropRect.width >= 1, cropRect.height >= 1,
+              let cropped = image.cropping(to: cropRect) else {
+            throw ScreenshotAppError.captureFailed("选区超出显示器范围")
+        }
+        return cropped
     }
 
     private static func scale(for display: SCDisplay) -> CGFloat {

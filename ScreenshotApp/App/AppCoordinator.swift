@@ -171,7 +171,7 @@ final class AppCoordinator {
         case .save:
             try await exportService.save(result.image)
         case .pin:
-            pinManager.createPin(for: result.image)
+            pinManager.createPin(for: result.image, near: pinSourceFrame(for: result.target))
         case .annotate:
             // The annotation editor will take ownership of the result in the next milestone.
             try await exportService.copyToPasteboard(result.image)
@@ -179,6 +179,31 @@ final class AppCoordinator {
         }
         if settings.playCaptureSound {
             NSSound(named: "Tink")?.play()
+        }
+    }
+
+    /// Converts the display-local, top-left-origin capture rectangle back into
+    /// AppKit global coordinates so a pin opens on the display it came from.
+    private func pinSourceFrame(for target: CaptureTarget) -> CGRect? {
+        switch target {
+        case let .region(displayID, rectInDisplay):
+            guard let screen = NSScreen.screens.first(where: {
+                Self.displayID(for: $0) == displayID
+            }) else {
+                return nil
+            }
+            return CGRect(
+                x: screen.frame.minX + rectInDisplay.minX,
+                y: screen.frame.maxY - rectInDisplay.maxY,
+                width: rectInDisplay.width,
+                height: rectInDisplay.height
+            )
+        case let .display(displayID):
+            return NSScreen.screens.first(where: {
+                Self.displayID(for: $0) == displayID
+            })?.visibleFrame
+        case .window:
+            return nil
         }
     }
 
@@ -199,13 +224,21 @@ extension AppCoordinator: CaptureOverlayControllerDelegate {
         on screen: NSScreen
     ) {
         guard let displayID = Self.displayID(for: screen),
-              let display = availableContent?.displays.first(where: { $0.id == displayID }) else {
+              availableContent?.displays.contains(where: { $0.id == displayID }) == true else {
             present(ScreenshotAppError.displayNotFound(0))
             return
         }
 
-        let globalFrame = display.frameInGlobalPoints.value
-        let localRect = rect.offsetBy(dx: -globalFrame.minX, dy: -globalFrame.minY)
+        // AppKit screen coordinates use a bottom-left origin, while
+        // ScreenCaptureKit's display-local crop coordinates use top-left.
+        let screenFrame = screen.frame
+        let selectedRect = rect.intersection(screenFrame)
+        let localRect = CGRect(
+            x: selectedRect.minX - screenFrame.minX,
+            y: screenFrame.maxY - selectedRect.maxY,
+            width: selectedRect.width,
+            height: selectedRect.height
+        )
         let action: CaptureCompletionAction
         switch overlayAction {
         case .copy: action = .copy
@@ -224,9 +257,38 @@ extension AppCoordinator: CaptureOverlayControllerDelegate {
         _ controller: CaptureOverlayController,
         windowAt globalPoint: CGPoint
     ) -> CGRect? {
-        availableContent?.windows
-            .first(where: { $0.frameInGlobalPoints.value.contains(globalPoint) })?
-            .frameInGlobalPoints.value
+        // CGWindowList (the source of the stored window bounds) uses a global
+        // top-left origin. AppKit overlay windows use a bottom-left origin.
+        // Compare in the former space, then return the highlight in the latter.
+        // Without this conversion the highlighted window is vertically offset,
+        // especially on a multi-display desktop.
+        let windowServerPoint = coreGraphicsPoint(fromAppKitPoint: globalPoint)
+        guard let windowFrame = availableContent?.windows
+            .first(where: { $0.frameInGlobalPoints.value.contains(windowServerPoint) })?
+            .frameInGlobalPoints.value else {
+            return nil
+        }
+        return appKitRect(fromCoreGraphicsRect: windowFrame)
+    }
+
+    private func coreGraphicsPoint(fromAppKitPoint point: CGPoint) -> CGPoint {
+        CGPoint(x: point.x, y: primaryDisplayTop - point.y)
+    }
+
+    private func appKitRect(fromCoreGraphicsRect rect: CGRect) -> CGRect {
+        CGRect(
+            x: rect.minX,
+            y: primaryDisplayTop - rect.maxY,
+            width: rect.width,
+            height: rect.height
+        )
+    }
+
+    /// Both APIs use global points, but their vertical origins are opposite.
+    /// The primary display's top edge is the stable axis shared by AppKit and
+    /// WindowServer when monitors are arranged above or below one another.
+    private var primaryDisplayTop: CGFloat {
+        NSScreen.main?.frame.maxY ?? 0
     }
 }
 
@@ -239,7 +301,7 @@ private final class PinWindowManager: PinWindowManaging {
         self.defaultOpacity = defaultOpacity
     }
 
-    func createPin(for image: CGImage) {
+    func createPin(for image: CGImage, near sourceFrame: CGRect?) {
         let sourceSize = CGSize(width: image.width, height: image.height)
         let maximum = CGSize(width: 460, height: 340)
         let scale = min(1, maximum.width / sourceSize.width, maximum.height / sourceSize.height)
@@ -268,9 +330,28 @@ private final class PinWindowManager: PinWindowManaging {
             panel?.close()
         }
         panel.contentView = contentView
-        panel.center()
+        position(panel, of: size, near: sourceFrame)
         panel.makeKeyAndOrderFront(nil)
         windows.append(panel)
+    }
+
+    private func position(_ panel: NSPanel, of size: CGSize, near sourceFrame: CGRect?) {
+        guard let sourceFrame,
+              let screen = NSScreen.screens.first(where: { $0.frame.intersects(sourceFrame) }) else {
+            panel.center()
+            return
+        }
+
+        // NSWindow uses a bottom-left origin. Align the pin's top-left corner
+        // to the selection and keep the entire window in that display's usable area.
+        let usableFrame = screen.visibleFrame
+        let maximumX = max(usableFrame.minX, usableFrame.maxX - size.width)
+        let maximumY = max(usableFrame.minY, usableFrame.maxY - size.height)
+        let origin = CGPoint(
+            x: min(max(sourceFrame.minX, usableFrame.minX), maximumX),
+            y: min(max(sourceFrame.maxY - size.height, usableFrame.minY), maximumY)
+        )
+        panel.setFrameOrigin(origin)
     }
 
     func closeAllPins() {

@@ -19,6 +19,7 @@ protocol ImageExporting: AnyObject {
 
 @MainActor
 protocol PinWindowManaging: AnyObject {
-    func createPin(for image: CGImage)
+    /// Displays the pin close to the source rectangle when one is available.
+    func createPin(for image: CGImage, near sourceFrame: CGRect?)
     func closeAllPins()
 }
