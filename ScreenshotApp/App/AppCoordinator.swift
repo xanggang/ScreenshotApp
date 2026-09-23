@@ -321,8 +321,14 @@ private final class PinWindowManager: PinWindowManaging {
         panel.isMovableByWindowBackground = false
         panel.alphaValue = defaultOpacity
         panel.isReleasedWhenClosed = false
+        panel.contentAspectRatio = sourceSize
+        panel.contentMinSize = Self.minimumPinSize(for: sourceSize)
 
-        let contentView = PinContentView(image: image, initialOpacity: defaultOpacity)
+        let contentView = PinContentView(
+            image: image,
+            initialOpacity: defaultOpacity,
+            aspectRatio: sourceSize.width / sourceSize.height
+        )
         contentView.onOpacityChanged = { [weak panel] opacity in
             panel?.alphaValue = opacity
         }
@@ -358,6 +364,12 @@ private final class PinWindowManager: PinWindowManaging {
         windows.forEach { $0.close() }
         windows.removeAll()
     }
+
+    private static func minimumPinSize(for imageSize: CGSize) -> CGSize {
+        let aspectRatio = imageSize.width / imageSize.height
+        let height = max(100, 140 / aspectRatio)
+        return CGSize(width: height * aspectRatio, height: height)
+    }
 }
 
 @MainActor
@@ -368,10 +380,29 @@ private final class PinContentView: NSView {
     private let imageView: NSImageView
     private let opacitySlider = NSSlider(value: 1, minValue: 0.2, maxValue: 1, target: nil, action: nil)
     private let controls = NSVisualEffectView()
+    private let resizeCornerSize: CGFloat = 12
+    private let dragAreaHeight: CGFloat = 32
+    private let imageAspectRatio: CGFloat
+    private var resizeEdge: ResizeEdge = []
+    private var resizeStartFrame: CGRect = .zero
+    private var resizeStartPoint: CGPoint = .zero
 
-    init(image: CGImage, initialOpacity: Double) {
+    private struct ResizeEdge: OptionSet {
+        let rawValue: Int
+        static let left = ResizeEdge(rawValue: 1 << 0)
+        static let right = ResizeEdge(rawValue: 1 << 1)
+        static let bottom = ResizeEdge(rawValue: 1 << 2)
+        static let top = ResizeEdge(rawValue: 1 << 3)
+    }
+
+    init(image: CGImage, initialOpacity: Double, aspectRatio: CGFloat) {
         imageView = NSImageView(image: NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height)))
+        imageAspectRatio = aspectRatio
         super.init(frame: .zero)
+        // NSPanel resizes its content view via autoresizing masks. Without
+        // these flags the root view stays at its creation size, leaving the
+        // image and interaction zones centered inside a larger window.
+        autoresizingMask = [.width, .height]
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.masksToBounds = true
@@ -438,13 +469,103 @@ private final class PinContentView: NSView {
         return hit === imageView ? self : hit
     }
 
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        for rect in resizeCornerRects {
+            addCursorRect(rect, cursor: .crosshair)
+        }
+    }
+
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        guard !controls.frame.contains(point), let window else {
+        let edge = resizeEdge(at: point)
+        if !edge.isEmpty, let window {
+            resizeEdge = edge
+            resizeStartFrame = window.frame
+            // This is a global AppKit coordinate. Unlike locationInWindow, it
+            // does not change when the panel's frame changes during a resize.
+            resizeStartPoint = NSEvent.mouseLocation
+            return
+        }
+        guard dragAreaRect.contains(point), !controls.frame.contains(point), let window else {
             super.mouseDown(with: event)
             return
         }
         window.makeKeyAndOrderFront(nil)
         window.performDrag(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard !resizeEdge.isEmpty, let window else {
+            super.mouseDragged(with: event)
+            return
+        }
+
+        let currentPoint = NSEvent.mouseLocation
+        let deltaX = currentPoint.x - resizeStartPoint.x
+        let deltaY = currentPoint.y - resizeStartPoint.y
+        let horizontalDelta = resizeEdge.contains(.left) ? -deltaX : deltaX
+        let verticalDelta = resizeEdge.contains(.bottom) ? -deltaY : deltaY
+
+        // Let the dominant drag direction control the resize, then derive the
+        // other dimension from the source image ratio. The image therefore
+        // always fills the panel, so its visible boundary and hit zones match.
+        let widthFromHorizontalDrag = resizeStartFrame.width + horizontalDelta
+        let widthFromVerticalDrag = (resizeStartFrame.height + verticalDelta) * imageAspectRatio
+        let usesHorizontalDrag = abs(horizontalDelta) >= abs(verticalDelta * imageAspectRatio)
+        let minimumWidth = max(140, 100 * imageAspectRatio)
+        let width = max(minimumWidth, usesHorizontalDrag ? widthFromHorizontalDrag : widthFromVerticalDrag)
+        let height = width / imageAspectRatio
+        var frame = resizeStartFrame
+        frame.size = CGSize(width: width, height: height)
+        if resizeEdge.contains(.left) {
+            frame.origin.x = resizeStartFrame.maxX - width
+        }
+        if resizeEdge.contains(.bottom) {
+            frame.origin.y = resizeStartFrame.maxY - height
+        }
+        window.setFrame(frame, display: true)
+        window.contentView?.needsLayout = true
+        // A borderless panel does not refresh its cursor rectangles after a
+        // programmatic frame change. Refresh them so subsequent resizes use
+        // the panel's new edges instead of its original bounds.
+        window.invalidateCursorRects(for: self)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        resizeEdge = []
+        super.mouseUp(with: event)
+    }
+
+    private func resizeEdge(at point: CGPoint) -> ResizeEdge {
+        if topLeftCornerRect.contains(point) { return [.top, .left] }
+        if topRightCornerRect.contains(point) { return [.top, .right] }
+        if bottomLeftCornerRect.contains(point) { return [.bottom, .left] }
+        if bottomRightCornerRect.contains(point) { return [.bottom, .right] }
+        return []
+    }
+
+    private var dragAreaRect: CGRect {
+        CGRect(x: 0, y: bounds.maxY - dragAreaHeight, width: bounds.width, height: dragAreaHeight)
+    }
+
+    private var resizeCornerRects: [CGRect] {
+        [topLeftCornerRect, topRightCornerRect, bottomLeftCornerRect, bottomRightCornerRect]
+    }
+
+    private var topLeftCornerRect: CGRect {
+        CGRect(x: 0, y: bounds.maxY - resizeCornerSize, width: resizeCornerSize, height: resizeCornerSize)
+    }
+
+    private var topRightCornerRect: CGRect {
+        CGRect(x: bounds.maxX - resizeCornerSize, y: bounds.maxY - resizeCornerSize, width: resizeCornerSize, height: resizeCornerSize)
+    }
+
+    private var bottomLeftCornerRect: CGRect {
+        CGRect(x: 0, y: 0, width: resizeCornerSize, height: resizeCornerSize)
+    }
+
+    private var bottomRightCornerRect: CGRect {
+        CGRect(x: bounds.maxX - resizeCornerSize, y: 0, width: resizeCornerSize, height: resizeCornerSize)
     }
 }
