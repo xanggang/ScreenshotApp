@@ -136,13 +136,20 @@ final class AppCoordinator {
     }
 
     private func capture(target: CaptureTarget, action: CaptureCompletionAction? = nil) {
+        let annotations = overlayController.annotationSnapshot
         overlayController.dismiss()
         Task { [weak self] in
             guard let self else { return }
             do {
                 // Give the WindowServer one frame to remove the overlay before capture.
                 try await Task.sleep(for: .milliseconds(80))
-                let result = try await captureService.capture(target)
+                let captured = try await captureService.capture(target)
+                let result = CaptureResult(
+                    image: annotations?.render(on: captured.image) ?? captured.image,
+                    target: captured.target,
+                    scale: captured.scale,
+                    capturedAt: captured.capturedAt
+                )
                 try await handleCaptureResult(result, action: action)
             } catch {
                 present(error)

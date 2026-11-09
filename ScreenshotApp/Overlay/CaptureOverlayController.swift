@@ -16,6 +16,10 @@ protocol CaptureOverlayControllerDelegate: AnyObject {
 final class CaptureOverlayController: NSObject {
     weak var delegate: CaptureOverlayControllerDelegate?
     private(set) var windows: [CaptureOverlayWindow] = []
+    var annotationSnapshot: AnnotationSnapshot? {
+        windows.compactMap { $0.contentView as? CaptureOverlayView }
+            .first(where: { $0.selection.hasSelection })?.annotationSnapshot
+    }
 
     func present() {
         dismiss()
